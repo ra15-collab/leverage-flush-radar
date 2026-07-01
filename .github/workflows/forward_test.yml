@@ -1,0 +1,50 @@
+name: Forward Test - Leverage Flush Radar (100 symbols)
+
+# Runs on its own, forever, for free, on a public repo.
+# Every 15 minutes: fetch live Binance data for the tracked top-100 USDT-M
+# perpetuals -> update each symbol's paper trade state -> commit the
+# updated data/ folder back to the repo. Nothing to babysit.
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes, UTC
+  workflow_dispatch: {}      # lets you also trigger it manually from the Actions tab
+
+# Prevent overlapping runs from racing on the same CSV files if one run
+# happens to take longer than 15 minutes.
+concurrency:
+  group: forward-test-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated data/ folder
+
+jobs:
+  run-cycle:
+    runs-on: ubuntu-latest
+    # 100 symbols x ~0.15s delay + per-symbol OI calls comfortably fits in a
+    # few minutes, but give it real headroom vs. the single-pair version.
+    timeout-minutes: 12
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas numpy
+
+      - name: Run one forward-test cycle (all tracked symbols)
+        run: python forward_test_signal_logger.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "forward-test-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Forward test cycle: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
