@@ -84,25 +84,33 @@ _TICKER_CACHE: dict = {}
 # ---------------------------------------------------------------------------
 
 def _get_json(url: str, _retries: int = 2) -> dict | list:
-    """Fetch JSON from `url`. Tries a direct request first (Bybit doesn't
-    geo-block cloud/CI IPs, so this normally succeeds immediately); falls
-    back to a couple of public proxies only if the direct request fails,
-    as a safety net against transient outages."""
+    """Fetch JSON from `url`. Tries direct requests first (against
+    api.bybit.com, then its bytick.com mirror -- Bybit doesn't geo-block
+    cloud/CI IPs the way Binance does, so one of these normally succeeds);
+    falls back to a couple of public proxies only if both direct attempts
+    fail, as a safety net against transient outages or bot-filtering."""
     encoded = urllib.parse.quote(url, safe="")
+    mirror_url = url.replace("api.bybit.com", "api.bytick.com")
     attempts = [
         url,
+        mirror_url,
         f"https://api.allorigins.win/raw?url={encoded}",
         f"https://api.codetabs.com/v1/proxy?quest={url}",
     ]
 
     errors = []
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     for attempt_url in attempts:
         for attempt in range(_retries):
             try:
-                req = urllib.request.Request(
-                    attempt_url,
-                    headers={"User-Agent": "Mozilla/5.0 forward-test-script"},
-                )
+                req = urllib.request.Request(attempt_url, headers=browser_headers)
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     return json.loads(resp.read().decode())
             except Exception as e:
