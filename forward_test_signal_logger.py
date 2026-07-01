@@ -22,11 +22,19 @@ One bad/delisted/rate-limited symbol must never take down the other 99 --
 every per-symbol step in run_cycle() is wrapped in try/except.
 
 No API key needed -- all Binance endpoints used here are public market data.
+
+NOTE ON NETWORKING: GitHub Actions runners use US datacenter IP addresses,
+and Binance geo-blocks all its endpoints (spot + futures) from US IPs,
+returning HTTP 451 for every direct request. There is no alternate Binance
+domain that avoids this -- the fix is to route requests through a public
+proxy so they don't originate from a blocked region. That's handled in
+_get_json() below, which every fetch function in this file goes through.
 """
 
 import json
 import time
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -58,7 +66,10 @@ cfg = Config()
 # ---------------------------------------------------------------------------
 
 def _get_json(url: str) -> dict | list:
-    req = urllib.request.Request(url, headers={"User-Agent": "forward-test-script"})
+    """Fetch JSON from `url`, routed through a public proxy to work around
+    Binance's HTTP 451 geo-block of US-hosted CI runners."""
+    proxied_url = "https://corsproxy.io/?url=" + urllib.parse.quote(url, safe="")
+    req = urllib.request.Request(proxied_url, headers={"User-Agent": "forward-test-script"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode())
 
