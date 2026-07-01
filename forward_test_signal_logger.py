@@ -65,32 +65,42 @@ cfg = Config()
 # 1. SYMBOL UNIVERSE (top N USDT-M perpetuals by 24h volume, cached weekly)
 # ---------------------------------------------------------------------------
 
-def _get_json(url: str) -> dict | list:
+def _get_json(url: str, _retries: int = 2) -> dict | list:
     """Fetch JSON from `url`, routed through a public proxy to work around
     Binance's HTTP 451 geo-block of US-hosted CI runners.
 
     Tries a short list of free proxy services in order, since any single
     one can be flaky, rate-limited, or block non-browser requests on a
-    given day. First one that returns valid JSON wins.
+    given day. First one that returns valid JSON wins. Each proxy is
+    retried a couple of times before moving to the next, since free proxies
+    often fail transiently (timeouts, gateway errors) rather than being
+    permanently broken.
     """
     encoded = urllib.parse.quote(url, safe="")
     proxy_templates = [
         f"https://api.allorigins.win/raw?url={encoded}",
         f"https://corsproxy.io/?url={encoded}",
         f"https://api.codetabs.com/v1/proxy?quest={url}",
+        f"https://thingproxy.freeboard.io/fetch/{url}",
     ]
 
-    last_error = None
+    errors = []
     for proxied_url in proxy_templates:
-        try:
-            req = urllib.request.Request(proxied_url, headers={"User-Agent": "Mozilla/5.0 forward-test-script"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.loads(resp.read().decode())
-        except Exception as e:
-            last_error = e
-            continue
+        for attempt in range(_retries):
+            try:
+                req = urllib.request.Request(
+                    proxied_url,
+                    headers={"User-Agent": "Mozilla/5.0 forward-test-script"},
+                )
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    return json.loads(resp.read().decode())
+            except Exception as e:
+                errors.append(f"{proxied_url.split('?')[0]} (attempt {attempt + 1}): {e}")
+                time.sleep(1)
+                continue
 
-    raise RuntimeError(f"All proxies failed for {url}. Last error: {last_error}")
+    error_summary = "\n  ".join(errors)
+    raise RuntimeError(f"All proxies failed for {url}:\n  {error_summary}")
 
 
 def _rank_top_symbols(n: int) -> list[str]:
