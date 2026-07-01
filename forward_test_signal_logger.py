@@ -21,14 +21,28 @@ Layout (created on first run):
 One bad/delisted/rate-limited symbol must never take down the other 99 --
 every per-symbol step in run_cycle() is wrapped in try/except.
 
-No API key needed -- all Binance endpoints used here are public market data.
+No API key needed -- all endpoints used here are public market data.
 
-NOTE ON NETWORKING: GitHub Actions runners use US datacenter IP addresses,
-and Binance geo-blocks all its endpoints (spot + futures) from US IPs,
-returning HTTP 451 for every direct request. There is no alternate Binance
-domain that avoids this -- the fix is to route requests through a public
-proxy so they don't originate from a blocked region. That's handled in
-_get_json() below, which every fetch function in this file goes through.
+NOTE ON NETWORKING / DATA SOURCE: This originally called Binance's futures
+API, but Binance geo-blocks all its endpoints (spot + futures) for
+datacenter/cloud IP ranges -- including GitHub Actions runners -- returning
+HTTP 451 regardless of proxy, since most free public proxies are *also*
+hosted on cloud IPs Binance blocks, or are themselves overloaded/rate
+limited. Chasing proxies for Binance specifically turned out to be
+unreliable in practice.
+
+The fix: use Bybit's public market-data API instead. Bybit does not block
+cloud/CI IPs the way Binance does, so requests work directly with no proxy
+needed. As a bonus, Bybit's /v5/market/tickers endpoint returns mark price,
+funding rate, AND open interest for every symbol in a single bulk call --
+so a full cycle needs just 2 HTTP requests total instead of the ~101
+Binance required (1 bulk call + 1 per-symbol open-interest call each).
+Symbol naming (e.g. "BTCUSDT") is identical between the two exchanges, so
+none of the downstream per-symbol state/logic below had to change.
+
+_get_json() still keeps a small proxy fallback chain as a safety net in
+case Bybit is ever unreachable from a given runner, but the primary path
+is now a direct request.
 """
 
 import json
@@ -51,14 +65,18 @@ from leverage_flush_radar import Config, generate_signals
 
 TOP_N_SYMBOLS = 100
 SYMBOL_LIST_MAX_AGE = timedelta(days=7)   # re-rank the universe weekly
-REQUEST_DELAY_SEC = 0.15                  # politeness delay between per-symbol OI calls
+REQUEST_DELAY_SEC = 0.15                  # politeness delay between per-symbol steps
 
 DATA_DIR = Path(__file__).parent / "data"
 SYMBOL_LIST_FILE = DATA_DIR / "symbol_list.json"
 
-BINANCE_BASE = "https://fapi.binance.com"
+EXCHANGE_BASE = "https://api.bybit.com"
 
 cfg = Config()
+
+# Populated once per cycle by _fetch_all_tickers(); fetch_open_interest()
+# reads from here instead of making a separate HTTP call per symbol.
+_TICKER_CACHE: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -66,61 +84,78 @@ cfg = Config()
 # ---------------------------------------------------------------------------
 
 def _get_json(url: str, _retries: int = 2) -> dict | list:
-    """Fetch JSON from `url`, routed through a public proxy to work around
-    Binance's HTTP 451 geo-block of US-hosted CI runners.
-
-    Tries a short list of free proxy services in order, since any single
-    one can be flaky, rate-limited, or block non-browser requests on a
-    given day. First one that returns valid JSON wins. Each proxy is
-    retried a couple of times before moving to the next, since free proxies
-    often fail transiently (timeouts, gateway errors) rather than being
-    permanently broken.
-    """
+    """Fetch JSON from `url`. Tries a direct request first (Bybit doesn't
+    geo-block cloud/CI IPs, so this normally succeeds immediately); falls
+    back to a couple of public proxies only if the direct request fails,
+    as a safety net against transient outages."""
     encoded = urllib.parse.quote(url, safe="")
-    proxy_templates = [
+    attempts = [
+        url,
         f"https://api.allorigins.win/raw?url={encoded}",
-        f"https://corsproxy.io/?url={encoded}",
         f"https://api.codetabs.com/v1/proxy?quest={url}",
-        f"https://thingproxy.freeboard.io/fetch/{url}",
     ]
 
     errors = []
-    for proxied_url in proxy_templates:
+    for attempt_url in attempts:
         for attempt in range(_retries):
             try:
                 req = urllib.request.Request(
-                    proxied_url,
+                    attempt_url,
                     headers={"User-Agent": "Mozilla/5.0 forward-test-script"},
                 )
-                with urllib.request.urlopen(req, timeout=25) as resp:
+                with urllib.request.urlopen(req, timeout=20) as resp:
                     return json.loads(resp.read().decode())
             except Exception as e:
-                errors.append(f"{proxied_url.split('?')[0]} (attempt {attempt + 1}): {e}")
+                errors.append(f"{attempt_url.split('?')[0]} (attempt {attempt + 1}): {e}")
                 time.sleep(1)
                 continue
 
     error_summary = "\n  ".join(errors)
-    raise RuntimeError(f"All proxies failed for {url}:\n  {error_summary}")
+    raise RuntimeError(f"All attempts failed for {url}:\n  {error_summary}")
+
+
+def _fetch_all_tickers() -> dict:
+    """One bulk call for ALL linear symbols' mark price, funding rate, open
+    interest, and 24h turnover (used for volume ranking). Populates the
+    module-level cache so fetch_open_interest() doesn't need its own
+    per-symbol HTTP call."""
+    global _TICKER_CACHE
+    data = _get_json(f"{EXCHANGE_BASE}/v5/market/tickers?category=linear")
+    rows = data.get("result", {}).get("list", [])
+    cache = {}
+    for row in rows:
+        try:
+            cache[row["symbol"]] = {
+                "close": float(row["markPrice"]),
+                "funding_rate": float(row.get("fundingRate") or 0.0),
+                "open_interest": float(row.get("openInterest") or 0.0),
+                "turnover24h": float(row.get("turnover24h") or 0.0),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue  # skip malformed rows rather than failing the whole cycle
+    _TICKER_CACHE = cache
+    return cache
 
 
 def _rank_top_symbols(n: int) -> list[str]:
-    """Pick the top-n USDT-margined perpetuals by 24h quote volume."""
-    exchange_info = _get_json(f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
+    """Pick the top-n USDT-margined perpetuals by 24h quote turnover."""
+    instruments = _get_json(f"{EXCHANGE_BASE}/v5/market/instruments-info?category=linear")
+    inst_rows = instruments.get("result", {}).get("list", [])
     eligible = {
-        s["symbol"]
-        for s in exchange_info["symbols"]
-        if s.get("contractType") == "PERPETUAL"
-        and s.get("quoteAsset") == "USDT"
-        and s.get("status") == "TRADING"
+        row["symbol"]
+        for row in inst_rows
+        if row.get("contractType") == "LinearPerpetual"
+        and row.get("quoteCoin") == "USDT"
+        and row.get("status") == "Trading"
     }
 
-    tickers = _get_json(f"{BINANCE_BASE}/fapi/v1/ticker/24hr")  # bulk, all symbols
+    tickers = _fetch_all_tickers()
     ranked = sorted(
-        (t for t in tickers if t["symbol"] in eligible),
-        key=lambda t: float(t.get("quoteVolume", 0.0)),
+        (s for s in eligible if s in tickers),
+        key=lambda s: tickers[s]["turnover24h"],
         reverse=True,
     )
-    return [t["symbol"] for t in ranked[:n]]
+    return ranked[:n]
 
 
 def load_or_refresh_symbol_list() -> list[str]:
@@ -147,20 +182,24 @@ def load_or_refresh_symbol_list() -> list[str]:
 
 def fetch_bulk_premium() -> dict:
     """One call for ALL symbols' mark price + funding rate."""
-    data = _get_json(f"{BINANCE_BASE}/fapi/v1/premiumIndex")  # no symbol param = all
+    tickers = _TICKER_CACHE or _fetch_all_tickers()
     return {
-        row["symbol"]: {
-            "close": float(row["markPrice"]),
-            "funding_rate": float(row["lastFundingRate"]),
-        }
-        for row in data
+        symbol: {"close": v["close"], "funding_rate": v["funding_rate"]}
+        for symbol, v in tickers.items()
     }
 
 
 def fetch_open_interest(symbol: str) -> float:
-    """No bulk endpoint exists for open interest -- one call per symbol."""
-    data = _get_json(f"{BINANCE_BASE}/fapi/v1/openInterest?symbol={symbol}")
-    return float(data["openInterest"])
+    """Reads from the bulk ticker cache (populated by fetch_bulk_premium's
+    call to _fetch_all_tickers earlier in the same cycle) instead of making
+    a separate HTTP call per symbol. Falls back to a fresh bulk fetch if
+    called standalone with an empty/stale cache."""
+    if symbol in _TICKER_CACHE:
+        return _TICKER_CACHE[symbol]["open_interest"]
+    tickers = _fetch_all_tickers()
+    if symbol not in tickers:
+        raise KeyError(f"{symbol} not found in exchange tickers")
+    return tickers[symbol]["open_interest"]
 
 
 # ---------------------------------------------------------------------------
