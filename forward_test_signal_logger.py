@@ -67,11 +67,30 @@ cfg = Config()
 
 def _get_json(url: str) -> dict | list:
     """Fetch JSON from `url`, routed through a public proxy to work around
-    Binance's HTTP 451 geo-block of US-hosted CI runners."""
-    proxied_url = "https://corsproxy.io/?url=" + urllib.parse.quote(url, safe="")
-    req = urllib.request.Request(proxied_url, headers={"User-Agent": "forward-test-script"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode())
+    Binance's HTTP 451 geo-block of US-hosted CI runners.
+
+    Tries a short list of free proxy services in order, since any single
+    one can be flaky, rate-limited, or block non-browser requests on a
+    given day. First one that returns valid JSON wins.
+    """
+    encoded = urllib.parse.quote(url, safe="")
+    proxy_templates = [
+        f"https://api.allorigins.win/raw?url={encoded}",
+        f"https://corsproxy.io/?url={encoded}",
+        f"https://api.codetabs.com/v1/proxy?quest={url}",
+    ]
+
+    last_error = None
+    for proxied_url in proxy_templates:
+        try:
+            req = urllib.request.Request(proxied_url, headers={"User-Agent": "Mozilla/5.0 forward-test-script"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise RuntimeError(f"All proxies failed for {url}. Last error: {last_error}")
 
 
 def _rank_top_symbols(n: int) -> list[str]:
